@@ -1,0 +1,95 @@
+
+1. Description
+
+hostRunner is a tool that can be used to check and/or execute commands on multiple hosts in parallel. It is highly customisable via the command line but with a bit of python knowledge it can easily be hacked to taste. The tool utilizes 2 thread pools, one to do the pinging to check if the hosts are alive and one to execute the commands. At this time hostRunner is dependant in 2 external tools, ping and plink or netcat (nc). The first is the standard ping used in any linux distro. Plink is part of the putty program which can be downloaded http://www.chiark.greenend.org.uk/~sgtatham/putty/ and built from sources. Plink is used because it supports password passing unlike ssh. Of course you just already have accepted the terminals certificate in order for it to be run. At this time hostRunner does not provide any expect-like funcionality although I plan to do so in the future. Netcat is not so straight forward as an open port and a listener must exist on the host. I really hope that in future version I will eliminate any need for external programs. 
+The reports are .csv files with semi-colon separators. The absolute minimum columns reported are 2 in case the host is not online (<IP>;<Alive|not>) or the just ping option is used (-j). In all other cases the minimum columns displayed are 4 (<IP>;<Alive|Not>;<Success|Failure of command>;<Comand result>). For easier access 2 links are created, latest_report and previous_report pointing to the respective files.
+
+2. Requirements
+
+- Python 2.4, or 2.6
+- Putty for linux or Netcat
+- ping
+
+
+3. Usage
+
+./hostRunner [options]
+
+Default behaviour
+If no command line options are used the folloing defaults are assumed:
+    
+    1. Maximum number of threads per pool = 10
+    2. Thread timeout = 60s
+    3. IP's list file = ip_list.txt
+    4. Commands = Any file inside the cmd directory (they are all concatenated)
+    5. Password = Whatever is present in the DEFAULT_PASS variable
+
+
+Options
+
+  --version             show program's version number and exit
+
+  -h, --help            show this help message and exit
+
+  -p PASSWD, --password=PASSWD 
+                        specify password to use
+                        (default = `None`)
+
+  -P NOPINGTHREADS, --no-ping-threads=NOPINGTHREADS
+                        specify number of ping threads to use.
+                        (default = 10)
+
+  -C NOCOMMANDTHREADS, --no-command-threads=NOCOMMANDTHREADS
+                        specify number of command threads to use.
+                        (default = 10)
+
+  -i IPFILE, --ip-file=IPFILE
+                        specify alternate ip list file.
+                        (default = `ip_list.txt`)
+
+  -c CMD, --commands-file=CMD
+                        specify a command file to use, otherwise whatever
+                        is in the ./cmd directory will be used in
+                        alphabetic order
+
+  -m CONNCMD, --connect-method=CONNCMD
+                        specify the method to connect to hosts.
+                        choices are 'plink', 'nc'.
+                        (default = `plink`)
+
+  -j, --just-ping       do not use a command file. Just ping the clients
+
+  -t TIMEOUT, --timeout=TIMEOUT
+                        Set max time (in seconds) the command file will run
+                        on a host. WARNING: Setting a timeout will double
+                        the command threads executed. If timeout = 0 threads
+                        will run until finished.
+                        (default = 60)
+
+
+4. Usage examples
+
+    ./hostRunner -C 100 -P 100 -i ip.txt -c check_dirs.txt -p pass123 
+    
+    Start a hostRunner session with 100 threads for pinging, 100 to handle command execution. Use the ip's present in the ip.txt file (Line feed separated), run the commans found inside the check_dirs.txt file and use password pass123
+
+    ./hostRunner -P 150 -j 
+
+    Start a hostRunner session with 150 ping threads to check if hosts are alive. Their IP's will be found in the default file ip_list.txt
+
+    ./hostRuner -P 80 -C 40 -t 30 -m nc
+
+    Start a hostRunner session with 80 ping threads 40 command threads and a thread timeout of 30s. Use netcat for communication. MUST edit hostRunner to set the NC_PORT to talk to (default=10000). The commands will be taken from the cmd directory and concatenated together
+
+    ./hostRunner -C 100 -P 100 -i ip.txt -c check_dirs.txt -p pass123  -t 0
+
+    As the first example but without timeout
+
+
+
+
+
+Copyright (c) Pantelis Evgenidis 2009 2010 2011
+
+
+Email: pantelis DOT evgenidis AT gmail DOT com
