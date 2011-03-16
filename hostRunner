@@ -1,0 +1,657 @@
+#!/usr/bin/env python
+# vim: ts=4 sts=4 sw=4 et ai sta
+""" 
+hostRunner will execute a command on multiple hosts in parallel
+
+If you need to manage a lot of number of identical hosts the need often arises
+where certain commands and/or reports must be run to all of them. With 
+hostRunner you can do exactly that. Specify a script to run give it an ip list
+and it will start multiple threads to execute the commands. As a backend it
+uses either plink or nc which is configurable on command line. Finally a report
+is created in the reports dir stating the outcome. hostRunner is highly confi-
+gurable and being a script it can be hacked to taste.
+
+Copyright (c) Pantelis Evgenidis 2009, 2010, 2011
+"""
+
+import sys
+import os
+import time
+import glob
+import shutil
+import Queue
+import threading
+import subprocess
+import atexit
+import signal
+
+from optparse import OptionParser
+from datetime import datetime
+
+__author__ = "Pantelis Evgenidis"
+__version__ = "1.0"
+
+
+# Defaults
+MAX_THREADS        = 10
+MAX_RETRIES        = 2
+DEFAULT_TIMEOUT    = 30
+DEFAULT_IPLIST     = "ip_list.txt"
+DEFAULT_CMDFILE    = ".commands"
+DEFAULT_PASS       = None
+DEFAULT_GROUP_NAME = "all"
+REPORTS_DIR        = "reports"
+PING_EXE           = "/bin/ping"
+PLINK_EXE          = "plink"
+PLINK_ARGS         = " -C -pw %s -m %s %s "
+NC_EXE             = "nc"
+NC_PORT            = 10000
+NC_ARGS            = " %s %d -w 30 < %s | xargs" 
+
+
+class Host:
+    """Host object information"""
+
+    def __init__(
+            self, 
+            ip_addr, 
+            password, 
+            timeout, 
+            command_file=None):
+        """Initialise the host with its ip, and all other values to 0"""
+
+        self.ip          = ip_addr
+        self.cmd_file    = command_file
+        self.pwd         = password
+        self.timeout     = timeout
+        self.cmd         = None
+        self.online      = False
+        self.id          = 0
+        self.last_ping   = None
+        self.retries     = 0
+        self.pingWait    = 2
+        self.report      = None
+        self.errReport   = None
+        self.report_time = 0
+        self.cmd_success = False
+
+
+class HostPool:
+    """Pool of Host objects"""
+
+    def __init__(self, 
+            ip_source, 
+            passwd, 
+            timeout, 
+            cmd_file=None):
+        """Initialize Host pool"""
+        self.ip_source       = ip_source
+        self.cmd_file        = cmd_file
+        self.passwd          = passwd
+        self.timeout         = timeout
+        self.pool            = []
+        self.onlineHosts     = 0
+        self.cmdSuccessHosts = 0
+        self.totalReports    = 0
+
+        self.initPool()
+
+
+    def initPool(self):
+        """Read the IP's from file and create the host object pool"""
+
+        # Get IP's determining the source first. Throws exception
+        # if not a file
+        iplist = open(self.ip_source)
+
+        for ip in iplist:
+            clean_ip = ip.rstrip("\n")
+            
+            if len(clean_ip):
+                self.pool.append(Host(
+                    clean_ip,
+                    self.passwd,
+                    self.timeout,
+                    self.cmd_file)
+                    )
+
+        iplist.close()
+
+
+    def toQ(self):
+        """Return a queue from the Host pool"""
+        
+        q = Queue.Queue()
+        for t in self.pool:
+            q.put(t)
+
+        return q
+
+
+    def stats(self):
+        """Return host pool statistics"""
+
+        for t in self.pool:
+            self.onlineHosts += int(t.online)
+            self.cmdSuccessHosts += int(t.cmd_success)
+            
+
+        return {'totalHosts':len(self.pool),
+                'onlineHosts':self.onlineHosts,
+                'offlineHosts':len(self.pool) - self.onlineHosts,
+                'successHosts':self.cmdSuccessHosts}
+
+    
+        
+    def which(self, filename):
+        """My version of bash which"""
+
+        custom_paths = ['./bin']
+        for path in os.environ["PATH"].split(os.pathsep) + custom_paths:
+            if os.access(path + "/" + filename, os.X_OK):
+                return True
+    
+        return False
+
+
+
+    def setConnectionCommand(self, connCmd):
+        """Set the program to use for connecting to hosts"""
+        
+        if connCmd == "plink":
+            if not self.which(PLINK_EXE):
+                raise StandardError("Error: Unable to find noBullPlink in \
+                        the path")
+
+            for t in self.pool:
+                t.cmd = PLINK_EXE + PLINK_ARGS % (
+                        t.pwd, 
+                        t.cmd_file, 
+                        t.ip)
+
+
+        elif connCmd == "nc":
+             
+            if not self.which("nc"):
+                raise StandardError("Error: Unable to find netcat(nc) in \
+                        the path")
+
+            for t in self.pool:
+                t.cmd = NC_EXE + NC_ARGS % (
+                        t.ip, 
+                        NC_PORT,
+                        t.cmd_file)
+                print t.pwd
+
+        else:
+            raise StandardError("Error: The specified connection \
+                    command '%s' is NOT supported" % connCmd)
+
+
+
+class PingThread(threading.Thread):
+    """Ping a host and determine its online status"""
+
+
+    def __init__(self, inQ, outQ, max_retries):
+        
+        self.inQ           = inQ
+        self.outQ          = outQ
+        self.stop          = False
+        self.retries       = max_retries
+        self.jobsCompleted = 0
+
+        threading.Thread.__init__(self)
+
+    def run(self):
+        """ 
+        Ping a host from the inQ and put to outQ if alive. 
+        Otherwise depending on the retries the host is pushed back 
+        in the queue. If after 'retries' it does not repsond its put back
+        in the queue without the online flag set
+        """
+        
+        while not self.stop:
+            try:
+                host = self.inQ.get(timeout=1)
+            except Queue.Empty:
+                break
+
+            ret = subprocess.call("%s -c 1 -W %d -i 0.5 %s" % (
+                                            PING_EXE,
+                                            host.pingWait,
+                                            host.ip),
+                                            shell=True,
+                                            stdout=open('/dev/null','w'),
+                                            stderr=open('/dev/null','w'))
+        
+            if not ret:
+                # Host is online
+                host.online = True
+                self.outQ.put(host)
+            else:
+                # Host is offline
+                if host.retries < self.retries:
+                    # Push back and retry
+                    host.retries += 1
+                    host.pingWait += 2
+                    self.inQ.put(host)
+                else:
+                    # Stop retring
+                    self.outQ.put(host)
+
+
+
+
+    def stopThread(self):
+        """Set the stop flag"""
+        
+        self.stop = True
+
+class ThreadPool:
+    """Thread pool to handle pings and commands"""
+
+    def __init__(self, tcount, commandThread, commandThreadArgs):
+
+        self.count = tcount
+        self.pool  = []
+
+        for i in range(self.count):
+            self.pool.append(commandThread(*commandThreadArgs))
+
+
+
+    def start(self):
+        """Start the threads in the pool"""
+
+        for th in self.pool:
+            th.start()
+
+
+    def isAlive(self):
+        """Returns true if at least one thread is still alive"""
+        
+        for th in self.pool:
+            if th.isAlive():
+                return True
+
+
+        return False
+
+    def stop(self):
+        """Stop all threads in the pool"""
+        for th in self.pool:
+            th.stopThread()
+
+ 
+
+class CMDThread(threading.Thread):
+    """Create a thread to run the specified command"""
+    
+    def __init__(self, inQ, outQ):
+        self.inQ           = inQ
+        self.outQ          = outQ
+        self.stop          = False
+        self.jobsCompleted = 0
+
+        threading.Thread.__init__(self)
+
+    def run(self):
+        """
+        Get a host from inQ and run the cmd files on it. Put the results 
+        in the outQ
+        """
+
+        while not self.stop:
+            try: 
+                host = self.inQ.get(timeout=1)
+            except Queue.Empty:
+                continue
+
+            d = datetime.today()
+            if host.online:
+                p = subprocess.Popen(host.cmd,
+                        shell=True,
+                        stderr=subprocess.PIPE,
+                        stdout=subprocess.PIPE)
+                
+                # Only use the timeout feature if t > 0
+                if host.timeout:
+                    wd = threading.Timer(host.timeout, 
+                            os.kill, 
+                            (p.pid, signal.SIGKILL))
+                    wd.start()
+
+
+                host.report_time = d.ctime()
+                host.report, host.errReport = p.communicate()
+                
+                if host.timeout:
+                    wd.cancel()
+
+                if not p.returncode:
+                    host.cmd_success = True
+                else:
+                    host.report = "ERROR (%d)" % p.returncode
+
+                
+            else:
+                host.report_time = d.ctime()
+         
+            self.outQ.put(host)
+            self.jobsCompleted += 1
+
+
+    def stopThread(self):
+        """Set the flag to stop this thread"""
+        self.stop = True
+
+ 
+ 
+class hostRunner:
+    """Main hostRunner class"""
+
+    def __init__(self):
+
+        self.commandPool = None
+        # Initialise options
+        self.initOptions()
+        
+        # Check if we are root
+        self.validateUser()
+
+
+        self.hostPool = HostPool(self.options.ipFile,  
+                                 self.options.passwd,
+                                 self.options.timeout,
+                                 self.options.cmd)
+         
+        # Create the reports directory
+        if not os.path.isdir(REPORTS_DIR):
+            os.mkdir(REPORTS_DIR)
+ 
+
+
+
+    def initPingPool(self):
+        """Initialize a ping pool to check if hosts are alive"""
+        
+        # Initialise the alive hosts queue
+        self.aliveQ = Queue.Queue()
+
+        # Intialise the worker thread pool
+        self.pingPool = ThreadPool(self.options.noPingThreads,
+                                   PingThread,
+                                    [self.hostPool.toQ(), 
+                                     self.aliveQ,
+                                     MAX_RETRIES]
+                                    )
+
+    def initCommandPool(self):        
+        """Initialise the command thread"""
+               
+        # Create a temp_cmd file concatenating all commands
+        if self.options.cmd == DEFAULT_CMDFILE:
+            dst = open(self.options.cmd,'wb')
+            cmd_files = glob.glob('./cmd/*.cmd')
+            if not len(cmd_files):
+                raise StandardError("Error: no cmd file specifed \
+                        and no cmd files exist in cmd directory")
+
+            for f in cmd_files:
+                shutil.copyfileobj(open(f,'rb'), dst)
+
+            dst.close()
+
+
+        # Initialise the reports queue
+        self.reportQ = Queue.Queue()
+
+        self.hostPool.setConnectionCommand(self.options.connCmd)
+            
+        # Initialise the command execution 
+        self.commandPool = ThreadPool(self.options.noCommandThreads,
+                                      CMDThread,
+                                        [self.aliveQ, 
+                                         self.reportQ]
+                                        )
+
+
+
+    def initOptions(self):
+        """Initialise the program options"""
+        
+        usage = "usage: %prog [options]"
+
+        parser = OptionParser(usage, version=__version__)
+        
+        parser.add_option( 
+                "-p", 
+                "--password", 
+                action = "store", 
+                dest = "passwd", 
+                type = "string", 
+                default = DEFAULT_PASS,
+                help = "specify password to use.\
+                        (default = `%s`)" % DEFAULT_PASS
+                )
+
+        parser.add_option( 
+                "-P", 
+                "--no-ping-threads", 
+                action = "store", 
+                dest = "noPingThreads", 
+                type = "int", 
+                default = MAX_THREADS, 
+                help = "specify number of ping threads to use.\
+                        (default = %d)" % MAX_THREADS 
+                )
+        
+        parser.add_option( 
+                "-C", 
+                "--no-command-threads", 
+                action = "store", 
+                dest = "noCommandThreads", 
+                type = "int", 
+                default = MAX_THREADS, 
+                help = "specify number of command threads to use.\
+                        (default = %d)" % MAX_THREADS 
+                )
+
+        parser.add_option( 
+                "-i", 
+                "--ip-file", 
+                action = "store", 
+                dest = "ipFile", 
+                type = "string", 
+                default = DEFAULT_IPLIST, 
+                help = "specify alternate ip list file.\
+                        (default = `%s`)" % DEFAULT_IPLIST 
+                )
+
+        parser.add_option( 
+                "-c", 
+                "--commands-file", 
+                action = "store", 
+                dest = "cmd", 
+                default = DEFAULT_CMDFILE,
+                type = "string", 
+                help = "specify a command file to use, otherwise whatever \
+                        is in the ./cmd directory will be used in \
+                        alphabetic order" 
+                )
+
+        parser.add_option( 
+                "-m", 
+                "--connect-method", 
+                action = "store", 
+                dest = "connCmd", 
+                type = "choice", 
+                choices = ["plink", "nc"], 
+                default = "plink",
+                help = "specify the method to connect to hosts.\
+                        choices are 'plink', 'nc'.\
+                        (default = `plink`)"
+                )
+
+        parser.add_option( 
+                "-j", 
+                "--just-ping", 
+                action = "store_true", 
+                dest = "justPing", 
+                default = False,
+                help = "do not use a command file. Just ping the clients" 
+                )
+
+        parser.add_option( 
+                "-t", 
+                "--timeout", 
+                action = "store",
+                type = "int",
+                dest = "timeout", 
+                default = DEFAULT_TIMEOUT,
+                help = "Set max time (in seconds) the command file will run \
+                        on a host. WARNING: Setting a timeout will double \
+                        the command threads executed. If timeout = 0 threads \
+                        will run until finished. \
+                        (default = %d)" % DEFAULT_TIMEOUT
+                )
+
+        (self.options, self.args) = parser.parse_args()
+
+
+   
+    
+
+    def validateUser(self):
+        """Check if the user is root"""
+        if os.geteuid():
+            raise StandardError("Error: you MUST be root to use this tool")
+
+
+
+    def getReport(self, Q):
+        """Start getting reports as soon as the threads start"""
+
+        d = datetime.today()
+        # Filename to be used for reports
+        latest_report = "./%s/latest_report" % REPORTS_DIR
+        previous_report = "./%s/previous_report" % REPORTS_DIR
+        fname = "./%s/%02d%02d%02d-%02d%02d-report.csv" % (REPORTS_DIR,
+                                                      d.year,
+                                                      d.month,
+                                                      d.day,
+                                                      d.hour,
+                                                      d.minute)
+        rf = open(fname, 'w')
+        # Start getting reports 
+        reportCount = 0 
+        rollList = ['|', '/', '-', '\\']
+        print "%d %d" % ( reportCount, len(self.hostPool.pool) )
+        while reportCount < len(self.hostPool.pool):
+            try:
+                host = Q.get(timeout = 2)
+            except Queue.Empty:
+                continue
+           
+            if host.online and not self.options.justPing:
+                if host.cmd_success and not host.errReport:
+                    rf.write("%s;%s;%s;%s\n" % (
+                        host.ip, 
+                        host.online, 
+                        "SUCCESS", 
+                        host.report.replace('\n', ' ')))
+                else:
+                    rf.write("%s;%s;%s;%s\n" % (
+                        host.ip, 
+                        host.online, 
+                        "FAILURE", 
+                        host.errReport.replace('\n', ' ')))
+            else:
+                rf.write("%s;%s\n" % (host.ip, host.online))
+
+
+              
+            rf.flush()
+            
+            sys.stdout.write("\rHosts remaining: %6d \t\t\t%s" % ( 
+                int(len(self.hostPool.pool) - reportCount ), 
+                rollList[reportCount % 4]))
+            sys.stdout.flush()
+
+            reportCount += 1
+    
+        print 
+        rf.close()
+
+        if os.path.islink(previous_report):
+            os.remove(previous_report)
+
+        if os.path.islink(latest_report):
+            os.rename(latest_report,previous_report)
+
+
+        os.symlink(os.path.split(fname)[1], latest_report)
+
+
+    def start(self):
+        """Commence the tool execution"""
+        
+        # The absolute minimum is to start a ping pool and determine
+        # which hosts are alive
+        self.initPingPool()
+        self.pingPool.start()
+                
+
+        if self.options.justPing:
+            self.getReport(self.aliveQ)
+        else:
+            self.initCommandPool()
+            self.commandPool.start()
+            self.getReport(self.reportQ)
+            self.commandPool.stop()
+    
+    def stop_all(self):
+        """Stop all threads"""
+        if self.pingPool:
+            self.pingPool.stop()
+        
+        
+        if self.commandPool:
+            self.commandPool.stop()
+
+    def showStats(self):
+        """Show statistics"""
+
+        stats = self.hostPool.stats()
+
+        print "##########################################"
+        print "## Statistics                            #"
+        print "##########################################"
+        print "## Total no. Hosts    : %-6d       #" % \
+                stats['totalHosts']
+        print "## Online Hosts       : %-6d       #" % \
+                stats['onlineHosts']
+        print "## CMD success Hosts  : %-6d       #" % \
+                stats['successHosts'] 
+        print "## Offline Hosts      : %-6d       #" % \
+                stats['offlineHosts'] 
+        print "##########################################"
+   
+
+if __name__ == "__main__":
+    
+    tool = hostRunner()
+
+    atexit.register(tool.stop_all)
+    print "Initialised hostRunner on: " + datetime.today().ctime()
+    print "No. hosts: %d" % len(tool.hostPool.pool)
+
+    startTime = int(time.time())
+    tool.start()
+    endTime = int(time.time())
+    print "Execution finished on: " +  datetime.today().ctime()
+    print "Total execution time was: %d sec" % (endTime - startTime)
+
+    tool.showStats()
+#### EOF ######################################################################
