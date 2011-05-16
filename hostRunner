@@ -49,6 +49,7 @@ NC_PORT            = 10000
 NC_ARGS            = " %s %d -w 30 < %s | xargs" 
 
 
+
 class Host:
     """Host object information"""
 
